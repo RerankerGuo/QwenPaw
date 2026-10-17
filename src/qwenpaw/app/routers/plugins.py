@@ -45,7 +45,7 @@ _MARKET_MARKER_FILE = ".qwenpaw-market.json"
 # ``{market}/plugins/{owner}/{name}/archive/zip/{ref}`` download URLs
 # (the shape both ``buildMarketDownloadUrl`` and the update flow use).
 _MARKET_ARCHIVE_URL_RE = re.compile(
-    r"^/plugins/(?P<owner>[^/\s]+)/(?P<name>[^/\s]+)/archive/zip/[^/\s]+$"
+    r"^/plugins/(?P<owner>[^/\s]+)/(?P<name>[^/\s]+)/archive/zip/[^/\s]+$",
 )
 
 

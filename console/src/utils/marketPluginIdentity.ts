@@ -36,7 +36,9 @@ export function marketPluginMatches(
 ): boolean {
   const recordedId = plugin.market_id?.trim();
   if (recordedId) {
-    return normalizeMarketPluginId(recordedId) === normalizeMarketPluginId(entry.id);
+    return (
+      normalizeMarketPluginId(recordedId) === normalizeMarketPluginId(entry.id)
+    );
   }
 
   const pluginId = normalizeMarketPluginId(plugin.id);

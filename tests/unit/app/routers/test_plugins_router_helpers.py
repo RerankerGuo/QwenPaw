@@ -252,7 +252,6 @@ class TestServePluginUiFile:
     def test_path_traversal_denied(self, ui_client, tmp_path, monkeypatch):
         """Call the handler directly: the HTTP layer normalizes '..'
         segments before routing, so traversal is probed at the function."""
-        import asyncio
         from types import SimpleNamespace
 
         from qwenpaw.app.routers.plugins import serve_plugin_ui_file
