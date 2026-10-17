@@ -197,7 +197,10 @@ def _warn_on_second_backend(root: Path) -> bool:
     if pid and pid != os.getpid():
         try:
             os.kill(pid, 0)
-        except OSError:
+        except (OSError, SystemError):
+            # On Windows CPython, probing a stale pid can surface WinError 6
+            # ("invalid handle") as SystemError instead of OSError; that must
+            # read as "peer not alive", not abort the startup hook (#8194).
             pass
         else:
             peer_alive = True
