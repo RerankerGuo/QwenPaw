@@ -297,34 +297,28 @@ class TestServePluginUiFile:
 
 
 class TestMarketProvenance:
-    def test_market_archive_url_yields_scoped_id(self):
-        assert (
-            _market_id_from_source(
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [
+            (
                 "https://platform.agentscope.io/plugins/onesix/"
                 "qwenpaw-plugin-tool-wait_agent_task/archive/zip/master",
-            )
-            == "@onesix/qwenpaw-plugin-tool-wait_agent_task"
-        )
-
-    def test_other_host_returns_none(self):
-        assert (
-            _market_id_from_source(
+                "@onesix/qwenpaw-plugin-tool-wait_agent_task",
+            ),
+            (
                 "https://example.com/plugins/onesix/demo/archive/zip/master",
-            )
-            is None
-        )
-
-    def test_non_archive_market_path_returns_none(self):
-        assert (
-            _market_id_from_source(
+                None,
+            ),
+            (
                 "https://platform.agentscope.io/plugins/onesix/demo",
-            )
-            is None
-        )
-
-    def test_local_path_returns_none(self):
-        assert _market_id_from_source("/tmp/plugin.zip") is None
-        assert _market_id_from_source("") is None
+                None,
+            ),
+            ("/tmp/plugin.zip", None),
+            ("", None),
+        ],
+    )
+    def test_market_id_from_source(self, source, expected):
+        assert _market_id_from_source(source) == expected
 
     def test_stamp_writes_marker_for_market_source(self, tmp_path):
         plugin_dir = tmp_path / "demo"
