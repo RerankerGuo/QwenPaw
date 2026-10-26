@@ -266,7 +266,7 @@ def _download_body(**overrides):
 def test_pool_download_returns_downloaded(client):
     with patch.object(
         skills_module,
-        "_download_pool_skills_blocking",
+        "_download_pool_skill",
         return_value={"downloaded": [{"workspace_id": "default"}]},
     ) as blocking:
         response = client.post(
@@ -282,7 +282,7 @@ def test_pool_download_returns_downloaded(client):
 def test_pool_download_preview_only_skips_copy(client):
     with patch.object(
         skills_module,
-        "_download_pool_skills_blocking",
+        "_download_pool_skill",
         return_value={"downloaded": []},
     ) as blocking:
         response = client.post(
@@ -301,7 +301,7 @@ def test_pool_download_surfaces_preflight_409(client):
 
     with patch.object(
         skills_module,
-        "_download_pool_skills_blocking",
+        "_download_pool_skill",
         side_effect=HTTPException(status_code=409, detail="conflict"),
     ):
         response = client.post(
@@ -342,7 +342,7 @@ async def test_pool_download_runs_off_the_event_loop():
 
     with patch.object(
         skills_module,
-        "_download_pool_skills_blocking",
+        "_download_pool_skill",
         blocking_download,
     ):
         ticker = asyncio.create_task(heartbeat())
