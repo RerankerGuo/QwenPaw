@@ -23,8 +23,9 @@ model via the ``formatter=`` constructor kwarg.
 from __future__ import annotations
 
 from contextvars import ContextVar
-from dataclasses import dataclass
-from typing import Any, ClassVar
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, ClassVar
+from urllib.parse import unquote_to_bytes
 
 # The capping formatters below override agentscope's ``_format_*_source``
 # methods, which are ``@staticmethod`` on the base classes, with instance
@@ -73,9 +74,24 @@ _DASHSCOPE_AUDIO_FORMAT_BY_MIME = {
 
 @dataclass
 class _MediaBudget:
-    """Bytes still available for inlining in the current request."""
+    """Per-request inline media accounting.
+
+    The first format pass *measures*: every media block the formatters touch
+    reports its size in wire order (``sizes``) and nothing is capped by the
+    cumulative budget. When the measured total overflows, the request is
+    formatted a second time with ``dropped_prefix`` set — the byte total of
+    the oldest media to drop so the newest fit the budget.
+    """
 
     remaining: int
+    sizes: list[int] | None = field(default=None)
+    dropped_prefix: int = 0
+    position: int = 0
+
+    @property
+    def measuring(self) -> bool:
+        """Whether this budget is in the measure-everything first pass."""
+        return self.sizes is not None
 
 
 # One budget per in-flight format() call.  A ContextVar (rather than
@@ -87,14 +103,36 @@ _request_media_budget: ContextVar[_MediaBudget | None] = ContextVar(
 )
 
 
+def _data_url_size(url: str) -> int | None:
+    """Byte size of the payload carried by a ``data:`` URL.
+
+    A ``data:`` URL is inlined verbatim into the request body, so it counts
+    toward the media budget exactly like a ``Base64Source``. Non-``data:``
+    URLs (remote http(s), local ``file://``) return ``None``.
+    """
+    if not url.startswith("data:"):
+        return None
+    header, separator, payload = url.partition(",")
+    if not separator or not payload:
+        # Malformed data URL: leave it for the provider to reject.
+        return None
+    if ";base64" in header:
+        # base64 length -> approximate raw byte count, matching the
+        # Base64Source approximation.
+        return len(payload.strip()) * 3 // 4
+    return len(unquote_to_bytes(payload))
+
+
 def inline_media_size(source: Any) -> int | None:
     """Return the byte size of *source* if it would be inlined locally.
 
     Returns ``None`` for remote URLs (not read from disk here) and for
     unrecognised source types so the caller leaves them untouched.
+    Inline ``data:`` URLs are sized like ``Base64Source``: their payload
+    is embedded in the request body as-is.
     """
     if isinstance(source, URLSource):
-        return None
+        return _data_url_size(str(source.url or ""))
     if isinstance(source, Base64Source):
         # base64 length -> approximate raw byte count.
         return len(source.data or "") * 3 // 4
@@ -126,16 +164,62 @@ class CappingFormatterMixin:  # pylint: disable=too-few-public-methods
     _inline_media_size = staticmethod(inline_media_size)
 
     def _begin_media_budget(self) -> Any:
-        """Start a fresh per-request budget; returns its reset token."""
+        """Start a measuring per-request budget; returns its reset token."""
         if self.max_bytes <= 0 or self.max_total_bytes <= 0:
             return None
         return _request_media_budget.set(
-            _MediaBudget(self.max_total_bytes),
+            _MediaBudget(remaining=self.max_total_bytes, sizes=[]),
         )
 
     def _end_media_budget(self, token: Any) -> None:
         if token is not None:
             _request_media_budget.reset(token)
+
+    async def _format_under_media_budget(
+        self,
+        format_call: Callable[[], Awaitable[list]],
+    ) -> list:
+        """Run one format() call under the per-request media budget.
+
+        The first pass measures every media block and does not enforce the
+        cumulative budget, so under-budget requests (the common case) are
+        returned as formatted. When the measured total overflows, the
+        request is formatted a second time, dropping the oldest media (a
+        byte prefix of the wire order) until the remaining media fit the
+        budget — formatting walks the conversation oldest-first, so this
+        keeps the *newest* media.
+        """
+        if self.max_bytes <= 0 or self.max_total_bytes <= 0:
+            return await format_call()
+
+        token = self._begin_media_budget()
+        try:
+            result = await format_call()
+            budget = _request_media_budget.get()
+            sizes = list(budget.sizes) if budget is not None else []
+        finally:
+            self._end_media_budget(token)
+
+        total = sum(sizes)
+        if total <= self.max_total_bytes:
+            return result
+
+        dropped_prefix = 0
+        for size in sizes:
+            dropped_prefix += size
+            if total - dropped_prefix <= self.max_total_bytes:
+                break
+
+        token = _request_media_budget.set(
+            _MediaBudget(
+                remaining=self.max_total_bytes,
+                dropped_prefix=dropped_prefix,
+            ),
+        )
+        try:
+            return await format_call()
+        finally:
+            self._end_media_budget(token)
 
     def _placeholder_text(self, kind: str, size: int) -> str:
         return (
@@ -191,10 +275,12 @@ class CappingFormatterMixin:  # pylint: disable=too-few-public-methods
         source: Any,
         kind: str,
     ) -> dict[str, Any] | None:
-        """Spend the per-request budget, or cap once it is exhausted.
+        """Measure the media (first pass) or enforce the budget (second).
 
-        Formatting walks the conversation oldest-first, so exhausting the
-        budget as it is spent keeps the newest media and drops the oldest.
+        The enforcing pass replaces the planned ``dropped_prefix`` bytes of
+        oldest media with placeholders, so the budget is spent on the newest
+        media. The per-request ``remaining`` check stays as a backstop in
+        case the two passes ever disagree.
         """
         budget = _request_media_budget.get()
         if budget is None:
@@ -202,6 +288,16 @@ class CappingFormatterMixin:  # pylint: disable=too-few-public-methods
         size = self._inline_media_size(source)
         if size is None:
             return None
+        if budget.measuring:
+            budget.sizes.append(size)
+            return None
+        budget.position += size
+        if budget.position <= budget.dropped_prefix:
+            # This block lies inside the dropped oldest prefix.
+            return self._placeholder_total(
+                kind,
+                max(0, budget.position - budget.dropped_prefix),
+            )
         if size > budget.remaining:
             return self._placeholder_total(
                 kind,
@@ -240,14 +336,24 @@ class _CappingOpenAIFormatter(OpenAIChatFormatter, CappingFormatterMixin):
 
     async def format(self, *args: Any, **kwargs: Any) -> list:
         """Scope the media budget, then mark a stable prefix if opted in."""
-        token = self._begin_media_budget()
-        try:
-            result = await super().format(*args, **kwargs)
-        finally:
-            self._end_media_budget(token)
+        parent = super()
+        result = await self._format_under_media_budget(
+            lambda: parent.format(*args, **kwargs),
+        )
         if self.enable_prompt_cache_breakpoint:
             return mark_stable_prefix(result, responses=False)
         return result
+
+    def _format_file_source(
+        self,
+        source: URLSource | Base64Source,
+        name: str | None,
+    ) -> dict[str, Any]:
+        """Cap PDF attachments through the same budget as other media."""
+        capped = self._cap_media(source, "file")
+        if capped is not None:
+            return capped
+        return super()._format_file_source(source, name)
 
     def _format_image_source(
         self,
@@ -282,11 +388,10 @@ class _CappingAnthropicFormatter(
 
     async def format(self, msgs: list) -> list:
         """Scope the media budget to this request."""
-        token = self._begin_media_budget()
-        try:
-            return await super().format(msgs)
-        finally:
-            self._end_media_budget(token)
+        parent = super()
+        return await self._format_under_media_budget(
+            lambda: parent.format(msgs),
+        )
 
     def _format_source(
         self,
@@ -313,11 +418,10 @@ class _CappingGeminiFormatter(GeminiChatFormatter, CappingFormatterMixin):
 
     async def format(self, msgs: list) -> list:
         """Scope the media budget to this request."""
-        token = self._begin_media_budget()
-        try:
-            return await super().format(msgs)
-        finally:
-            self._end_media_budget(token)
+        parent = super()
+        return await self._format_under_media_budget(
+            lambda: parent.format(msgs),
+        )
 
     def _placeholder(self, kind: str, size: int) -> dict[str, Any]:
         return {"text": self._placeholder_text(kind, size)}
@@ -356,11 +460,10 @@ class _CappingDashScopeFormatter(
 
     async def format(self, msgs: list) -> list:
         """Scope the media budget to this request."""
-        token = self._begin_media_budget()
-        try:
-            return await super().format(msgs)
-        finally:
-            self._end_media_budget(token)
+        parent = super()
+        return await self._format_under_media_budget(
+            lambda: parent.format(msgs),
+        )
 
     def _format_video_source(
         self,
@@ -426,11 +529,10 @@ class _CappingOpenAIResponseFormatter(
 
     async def format(self, *args: Any, **kwargs: Any) -> list:
         """Scope the media budget, then apply Responses breakpoints."""
-        token = self._begin_media_budget()
-        try:
-            result = await super().format(*args, **kwargs)
-        finally:
-            self._end_media_budget(token)
+        parent = super()
+        result = await self._format_under_media_budget(
+            lambda: parent.format(*args, **kwargs),
+        )
         if self.enable_prompt_cache_breakpoint:
             return mark_stable_prefix(result, responses=True)
         return result
@@ -468,3 +570,14 @@ class _CappingOpenAIResponseFormatter(
         if unprepared is not None:
             return unprepared
         return super()._format_image_source(source)
+
+    def _format_file_source(
+        self,
+        source: URLSource | Base64Source,
+        name: str | None,
+    ) -> dict[str, Any]:
+        """Cap PDF attachments through the same budget as other media."""
+        capped = self._cap_media(source, "file")
+        if capped is not None:
+            return capped
+        return super()._format_file_source(source, name)

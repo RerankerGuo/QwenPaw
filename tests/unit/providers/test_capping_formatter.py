@@ -17,7 +17,7 @@ import asyncio
 
 import pytest
 
-from agentscope.message import Base64Source, DataBlock, Msg, TextBlock
+from agentscope.message import Base64Source, DataBlock, Msg, TextBlock, URLSource
 
 from qwenpaw.providers.capping_formatter import (
     MAX_INLINE_MEDIA_BYTES,
@@ -27,6 +27,7 @@ from qwenpaw.providers.capping_formatter import (
     _CappingGeminiFormatter,
     _CappingOpenAIFormatter,
     _CappingOpenAIResponseFormatter,
+    _MediaBudget,
     _request_media_budget,
     inline_media_size,
 )
@@ -85,6 +86,30 @@ def test_base64_source_size_approximated() -> None:
     # 8 base64 chars -> ~6 raw bytes.
     source = Base64Source(data="AAAAAAAA", media_type="image/png")
     assert inline_media_size(source) == 6
+
+
+def test_data_url_size_counted() -> None:
+    """A base64 data: URL is inlined verbatim, so it is sized like a
+    Base64Source (#8028 review: inline data: URLs bypassed the budget)."""
+    payload = "A" * 684  # 684 base64 chars -> ~513 raw bytes
+    source = URLSource(
+        url=f"data:image/png;base64,{payload}",
+        media_type="image/png",
+    )
+    assert inline_media_size(source) == 513
+
+
+def test_percent_encoded_data_url_size_counted() -> None:
+    source = URLSource(
+        url="data:text/plain,hello%20world",
+        media_type="text/plain",
+    )
+    assert inline_media_size(source) == 11
+
+
+def test_malformed_data_url_returns_none() -> None:
+    source = URLSource(url="data:image/png;base64,", media_type="image/png")
+    assert inline_media_size(source) is None
 
 
 def test_unknown_source_returns_none() -> None:
@@ -308,6 +333,11 @@ def test_non_http_remote_scheme_passthrough() -> None:
 # used below, so only the cumulative budget can fire.
 _EACH_IMAGE_BYTES = 512
 
+# What _base64_source(_EACH_IMAGE_BYTES, ...) emits, and what
+# inline_media_size therefore measures for it.
+_B64_CHARS = ((_EACH_IMAGE_BYTES + 2) // 3) * 4
+_MEASURED_BYTES = _B64_CHARS * 3 // 4
+
 
 def _image_msg(index: int, size: int = _EACH_IMAGE_BYTES) -> Msg:
     """A user message carrying one in-memory image block."""
@@ -319,6 +349,39 @@ def _image_msg(index: int, size: int = _EACH_IMAGE_BYTES) -> Msg:
             DataBlock(
                 source=_base64_source(size, "image/png"),
                 name=f"img{index}.png",
+            ),
+        ],
+    )
+
+
+def _data_url_image_msg(index: int) -> Msg:
+    """A user message carrying one inline ``data:`` URL image block."""
+    return Msg(
+        name="user",
+        role="user",
+        content=[
+            TextBlock(text=f"look at this {index}"),
+            DataBlock(
+                source=URLSource(
+                    url=f"data:image/png;base64,{'A' * _B64_CHARS}",
+                    media_type="image/png",
+                ),
+                name=f"img{index}.png",
+            ),
+        ],
+    )
+
+
+def _pdf_msg(index: int) -> Msg:
+    """A user message carrying one in-memory PDF attachment."""
+    return Msg(
+        name="user",
+        role="user",
+        content=[
+            TextBlock(text=f"read this {index}"),
+            DataBlock(
+                source=_base64_source(_EACH_IMAGE_BYTES, "application/pdf"),
+                name=f"doc{index}.pdf",
             ),
         ],
     )
@@ -348,7 +411,15 @@ def _total_limit_placeholders(parts: list[dict]) -> list[dict]:
 
 
 # Keys each provider uses to carry an actually-inlined media payload.
-_MEDIA_PAYLOAD_KEYS = ("inline_data", "image_url", "source", "input_audio")
+# ``file`` / ``file_data`` cover OpenAI Chat and Responses PDF attachments.
+_MEDIA_PAYLOAD_KEYS = (
+    "inline_data",
+    "image_url",
+    "source",
+    "input_audio",
+    "file",
+    "file_data",
+)
 
 
 def _media_parts(parts: list[dict]) -> list[dict]:
@@ -363,23 +434,45 @@ class TestCumulativeBudget:
     def test_default_total_budget_scales_with_the_per_file_cap(self) -> None:
         assert MAX_TOTAL_INLINE_MEDIA_BYTES == 4 * MAX_INLINE_MEDIA_BYTES
 
-    def test_budget_spends_down_and_then_caps(self) -> None:
+    def test_measure_pass_records_sizes_without_capping(self) -> None:
+        """The first pass measures every block and caps nothing."""
+        formatter = _CappingOpenAIFormatter(
+            max_bytes=1024,
+            max_total_bytes=1,
+        )
+        token = formatter._begin_media_budget()
+        try:
+            assert (
+                formatter._maybe_cap_total(
+                    _base64_source(_EACH_IMAGE_BYTES, "image/png"),
+                    "image",
+                )
+                is None
+            )
+            assert _request_media_budget.get().sizes == [_MEASURED_BYTES]
+        finally:
+            formatter._end_media_budget(token)
+
+    def test_enforce_pass_drops_the_planned_oldest_prefix(self) -> None:
+        """Blocks inside ``dropped_prefix`` are replaced with placeholders;
+        the first block past it is kept and spends the budget."""
         formatter = _CappingOpenAIFormatter(
             max_bytes=1024,
             max_total_bytes=900,
         )
-        token = formatter._begin_media_budget()
+        image = _base64_source(_EACH_IMAGE_BYTES, "image/png")
+        token = _request_media_budget.set(
+            _MediaBudget(remaining=900, dropped_prefix=_MEASURED_BYTES),
+        )
         try:
-            image = _base64_source(_EACH_IMAGE_BYTES, "image/png")
-            assert formatter._maybe_cap_total(image, "image") is None
+            dropped = formatter._maybe_cap_total(image, "image")
+            assert dropped is not None
+            assert "per-request limit" in dropped["text"]
+            assert "900-byte" in dropped["text"]
 
-            # The second image no longer fits: the budget is exhausted.
-            capped = formatter._maybe_cap_total(image, "image")
-            assert capped is not None
-            assert "per-request limit" in capped["text"]
-            assert "900-byte" in capped["text"]
+            assert formatter._maybe_cap_total(image, "image") is None
         finally:
-            formatter._end_media_budget(token)
+            _request_media_budget.reset(token)
 
     def test_media_over_the_per_file_cap_is_never_charged(self) -> None:
         """An oversized file is capped per-file, so it costs no budget."""
@@ -403,31 +496,7 @@ class TestCumulativeBudget:
                 )
                 is None
             )
-        finally:
-            formatter._end_media_budget(token)
-
-    def test_undersized_media_still_spends_the_budget(self) -> None:
-        formatter = _CappingOpenAIFormatter(
-            max_bytes=1024,
-            max_total_bytes=900,
-        )
-        token = formatter._begin_media_budget()
-        try:
-            assert (
-                formatter._cap_media(
-                    _base64_source(_EACH_IMAGE_BYTES, "image/png"),
-                    "image",
-                )
-                is None
-            )
-            # The budget really was spent.
-            assert (
-                formatter._cap_media(
-                    _base64_source(_EACH_IMAGE_BYTES, "image/png"),
-                    "image",
-                )
-                is not None
-            )
+            assert _request_media_budget.get().sizes == []
         finally:
             formatter._end_media_budget(token)
 
@@ -460,8 +529,9 @@ class TestCumulativeBudget:
 
         second = formatter._begin_media_budget()
         try:
-            # A fresh request gets the whole budget back.
+            # A fresh measuring pass sees no earlier charges.
             assert formatter._maybe_cap_total(image, "image") is None
+            assert _request_media_budget.get().sizes == [_MEASURED_BYTES]
         finally:
             formatter._end_media_budget(second)
 
@@ -480,11 +550,11 @@ class TestCumulativeBudgetEndToEnd:
         _ALL_CAPPING_FORMATTERS,
     )
     @pytest.mark.asyncio
-    async def test_oldest_media_dropped_newest_kept(
+    async def test_newest_media_kept_oldest_dropped(
         self,
         formatter_cls,
     ) -> None:
-        """Formatting walks oldest-first, so the newest media survives."""
+        """Overflow drops the *oldest* media; the newest image survives."""
         formatter = formatter_cls(max_bytes=1024, max_total_bytes=900)
         messages = [_image_msg(i) for i in range(3)]
 
@@ -493,8 +563,79 @@ class TestCumulativeBudgetEndToEnd:
         placeholders = _total_limit_placeholders(parts)
         assert len(placeholders) == 2
         assert "900-byte" in placeholders[0]["text"]
-        # Exactly one image is still inlined: the newest one.
-        assert len(_media_parts(parts)) == 1
+        # Exactly one image is still inlined, and identity matters: it is
+        # the newest one, i.e. the media part of the final message.
+        kept = _media_parts(parts)
+        assert len(kept) == 1
+        assert parts[-1] == kept[0]
+        assert "look at this 2" in (parts[-2].get("text") or "")
+
+    @pytest.mark.asyncio
+    async def test_data_url_images_are_budget_capped(self) -> None:
+        """Inline ``data:`` URLs are inlined bytes: they spend the budget."""
+        formatter = _CappingOpenAIFormatter(
+            max_bytes=1024,
+            max_total_bytes=900,
+        )
+
+        parts = _wire_parts(
+            await formatter.format(
+                [_data_url_image_msg(i) for i in range(3)],
+            ),
+        )
+
+        assert len(_total_limit_placeholders(parts)) == 2
+        kept = _media_parts(parts)
+        assert len(kept) == 1
+        assert parts[-1] == kept[0]
+
+    @pytest.mark.asyncio
+    async def test_openai_pdf_attachments_are_budget_capped(self) -> None:
+        """Chat Completions PDFs flow through ``_format_file_source``,
+        which must spend the same budget as image/audio media."""
+        formatter = _CappingOpenAIFormatter(
+            max_bytes=1024,
+            max_total_bytes=900,
+        )
+
+        parts = _wire_parts(
+            await formatter.format([_pdf_msg(i) for i in range(3)]),
+        )
+
+        assert len(_total_limit_placeholders(parts)) == 2
+        kept = _media_parts(parts)
+        assert len(kept) == 1
+        assert kept[0].get("type") == "file"
+
+    @pytest.mark.asyncio
+    async def test_responses_pdf_attachments_are_budget_capped(self) -> None:
+        """Responses API PDFs (``input_file`` parts) are capped too."""
+        formatter = _CappingOpenAIResponseFormatter(
+            max_bytes=1024,
+            max_total_bytes=900,
+        )
+
+        parts = _wire_parts(
+            await formatter.format([_pdf_msg(i) for i in range(3)]),
+        )
+
+        assert len(_total_limit_placeholders(parts)) == 2
+        kept = _media_parts(parts)
+        assert len(kept) == 1
+        assert kept[0].get("type") == "input_file"
+
+    @pytest.mark.asyncio
+    async def test_single_media_over_the_budget_is_dropped(self) -> None:
+        """When nothing smaller can be dropped, the only media goes."""
+        formatter = _CappingOpenAIFormatter(
+            max_bytes=4096,
+            max_total_bytes=900,
+        )
+
+        parts = _wire_parts(await formatter.format([_image_msg(0, 2048)]))
+
+        assert len(_total_limit_placeholders(parts)) == 1
+        assert _media_parts(parts) == []
 
     @pytest.mark.asyncio
     async def test_under_budget_nothing_is_capped(self) -> None:
