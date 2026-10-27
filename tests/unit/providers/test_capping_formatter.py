@@ -17,7 +17,13 @@ import asyncio
 
 import pytest
 
-from agentscope.message import Base64Source, DataBlock, Msg, TextBlock, URLSource
+from agentscope.message import (
+    Base64Source,
+    DataBlock,
+    Msg,
+    TextBlock,
+    URLSource,
+)
 
 from qwenpaw.providers.capping_formatter import (
     MAX_INLINE_MEDIA_BYTES,
@@ -58,23 +64,17 @@ def _base64_source(size: int, media_type: str):
 
 
 def test_url_source_size_is_left_to_async_preparation(tmp_path) -> None:
-    from agentscope.message import URLSource
-
     url = _write(tmp_path, "clip.mp4", 1024)
     source = URLSource(url=url, media_type="video/mp4")
     assert inline_media_size(source) is None
 
 
 def test_remote_url_is_not_inlined() -> None:
-    from agentscope.message import URLSource
-
     source = URLSource(url="https://example.com/v.mp4", media_type="video/mp4")
     assert inline_media_size(source) is None
 
 
 def test_missing_file_returns_none() -> None:
-    from agentscope.message import URLSource
-
     source = URLSource(
         url="file:///nonexistent/does-not-exist.mp4",
         media_type="video/mp4",
@@ -119,7 +119,6 @@ def test_unknown_source_returns_none() -> None:
 @pytest.mark.parametrize("data", [b"a", b"ab", b"abc"])
 def test_base64_size_excludes_padding(data):
     import base64
-    from agentscope.message import Base64Source
 
     source = Base64Source(
         data=base64.b64encode(data).decode("ascii"),
@@ -163,8 +162,6 @@ def test_maybe_cap_zero_disables() -> None:
 
 
 def test_maybe_cap_remote_url_not_capped() -> None:
-    from agentscope.message import URLSource
-
     source = URLSource(
         url="https://cdn.example.com/v.mp4",
         media_type="video/mp4",
@@ -212,6 +209,24 @@ def test_openai_oversized_audio_capped() -> None:
     )
     assert out["type"] == "text"
     assert "omitted" in out["text"]
+
+
+def test_openai_oversized_pdf_capped_per_file() -> None:
+    """PDF attachments also obey the per-file cap, not only the budget."""
+    out = _CappingOpenAIFormatter()._format_file_source(
+        _base64_source(MAX_INLINE_MEDIA_BYTES + 4, "application/pdf"),
+        "doc.pdf",
+    )
+    assert out["type"] == "text"
+    assert "omitted" in out["text"]
+
+
+def test_openai_small_pdf_passthrough() -> None:
+    out = _CappingOpenAIFormatter()._format_file_source(
+        _base64_source(2046, "application/pdf"),
+        "doc.pdf",
+    )
+    assert out["type"] == "file"
 
 
 def test_anthropic_oversized_image_capped() -> None:
@@ -281,8 +296,6 @@ def test_dashscope_oversized_video_capped() -> None:
 
 
 def test_dashscope_remote_video_passthrough_unchanged() -> None:
-    from agentscope.message import URLSource
-
     out = _CappingDashScopeFormatter()._format_video_source(
         URLSource(url="https://cdn.example.com/v.mp4", media_type="video/mp4"),
     )
@@ -299,8 +312,6 @@ def test_dashscope_remote_video_passthrough_unchanged() -> None:
 
 def _source_with_bare_path(path, media_type: str):
     """Create URLSource then assign bare path (mimics _fixup_media_list)."""
-    from agentscope.message import URLSource
-
     source = URLSource(url=f"file://{path}", media_type=media_type)
     source.url = str(path)
     return source
@@ -325,8 +336,6 @@ def test_prepared_image_is_formatted_without_file_access() -> None:
 
 def test_non_http_remote_scheme_passthrough() -> None:
     """s3://, oss://, ftp:// etc. pass through unchanged (#5934 H1)."""
-    from agentscope.message import URLSource
-
     for scheme_url in [
         "s3://bucket/image.png",
         "oss://bucket/image.png",
@@ -360,6 +369,27 @@ def _image_msg(index: int, size: int = _EACH_IMAGE_BYTES) -> Msg:
             TextBlock(text=f"look at this {index}"),
             DataBlock(
                 source=_base64_source(size, "image/png"),
+                name=f"img{index}.png",
+            ),
+        ],
+    )
+
+
+def _distinct_image_msg(index: int) -> Msg:
+    """A user message carrying one image whose bytes differ per index.
+
+    The Anthropic wire format deduplicates repeated media sources inside
+    one request, so the production-path tests need media that differ from
+    each other to exercise the budget rather than the dedup.
+    """
+    data = "A" * (_B64_CHARS - 1) + chr(ord("A") + index)
+    return Msg(
+        name="user",
+        role="user",
+        content=[
+            TextBlock(text=f"look at this {index}"),
+            DataBlock(
+                source=Base64Source(data=data, media_type="image/png"),
                 name=f"img{index}.png",
             ),
         ],
@@ -501,14 +531,15 @@ class TestCumulativeBudget:
             # The per-file placeholder fires, not the cumulative one.
             assert "inline limit of 512 bytes" in capped["text"]
             # ...so nothing was charged to the budget.
-            assert (
-                formatter._cap_media(
-                    _base64_source(64, "image/png"),
-                    "image",
-                )
-                is None
-            )
             assert _request_media_budget.get().sizes == []
+
+            # A source within the per-file cap *is* measured by the
+            # measuring pass, so it shows up in the budget accounting.
+            small = _base64_source(64, "image/png")
+            assert formatter._cap_media(small, "image") is None
+            assert _request_media_budget.get().sizes == [
+                inline_media_size(small),
+            ]
         finally:
             formatter._end_media_budget(token)
 
@@ -724,3 +755,47 @@ class TestCumulativeBudgetEndToEnd:
 
         for formatted in results:
             assert not _total_limit_placeholders(_wire_parts(formatted))
+
+
+class TestCumulativeBudgetThroughProductionWrapper:
+    """The budget must survive the formatter wrapper used in production.
+
+    The wrapper keeps a per-request media dedup scope around the whole
+    request.  The budget formats the request twice (measure, then
+    enforce), so the scope has to be reset between the passes — otherwise
+    the enforcing pass sees every source as "already shown above" and
+    drops all media, including the newest one the budget keeps.
+    """
+
+    @pytest.mark.asyncio
+    async def test_anthropic_wrapper_keeps_the_newest_media(self) -> None:
+        from qwenpaw.agents import model_factory
+
+        formatter_cls = model_factory._create_file_block_support_formatter(
+            _CappingAnthropicFormatter,
+        )
+        formatter = formatter_cls(max_bytes=1024, max_total_bytes=900)
+        messages = [_distinct_image_msg(i) for i in range(3)]
+
+        parts = _wire_parts(await formatter.format(messages))
+
+        kept = _media_parts(parts)
+        assert len(kept) == 1
+        assert parts[-1] == kept[0]
+        assert len(_total_limit_placeholders(parts)) == 2
+
+    @pytest.mark.asyncio
+    async def test_openai_wrapper_keeps_the_newest_media(self) -> None:
+        from qwenpaw.agents import model_factory
+
+        formatter_cls = model_factory._create_file_block_support_formatter(
+            _CappingOpenAIFormatter,
+        )
+        formatter = formatter_cls(max_bytes=1024, max_total_bytes=900)
+        messages = [_distinct_image_msg(i) for i in range(3)]
+
+        parts = _wire_parts(await formatter.format(messages))
+
+        kept = _media_parts(parts)
+        assert len(kept) == 1
+        assert parts[-1] == kept[0]

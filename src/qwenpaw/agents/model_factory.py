@@ -57,6 +57,7 @@ from ..providers.hub_managed import (
 from ..providers.capping_formatter import (
     CappingFormatterMixin,
     MAX_INLINE_MEDIA_BYTES,
+    SEEN_MEDIA_KEYS as _FORMATTER_SEEN_MEDIA_KEYS,
 )
 from ..providers.typesafe_provider import (
     TypeSafeEvaluationError,
@@ -156,10 +157,10 @@ class _LocalMediaRead:
     size_known: bool = True
 
 
-_FORMATTER_SEEN_MEDIA_KEYS: ContextVar[set[str] | None] = ContextVar(
-    "qwenpaw_formatter_seen_media_keys",
-    default=None,
-)
+# The per-request media dedup scope lives with the formatter media policy
+# in ``providers.capping_formatter`` (imported above as
+# ``_FORMATTER_SEEN_MEDIA_KEYS``) so the per-request inline-media budget
+# can reset it between its measuring and enforcing passes.
 
 
 def _read_local_media(

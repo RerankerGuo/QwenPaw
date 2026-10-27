@@ -102,6 +102,29 @@ _request_media_budget: ContextVar[_MediaBudget | None] = ContextVar(
     default=None,
 )
 
+# Per-request dedup scope for media sources: the second occurrence of a
+# source within one request becomes a short text placeholder instead of
+# another base64 copy.  The scope lives here, next to the per-request
+# media budget, because both are request-scoped formatter policy and must
+# agree on how many formatting passes a request performs.
+SEEN_MEDIA_KEYS: ContextVar[set[str] | None] = ContextVar(
+    "qwenpaw_formatter_seen_media_keys",
+    default=None,
+)
+
+
+def reset_seen_media_scope() -> None:
+    """Clear the active media dedup scope, if there is one.
+
+    The per-request media budget formats a request twice (measure, then
+    enforce).  Both passes must observe the same dedup scope: without a
+    reset the enforcing pass sees every source as "already shown above"
+    and drops all media, including the newest one the budget keeps.
+    """
+    seen = SEEN_MEDIA_KEYS.get()
+    if seen is not None:
+        seen.clear()
+
 
 def _data_url_size(url: str) -> int | None:
     """Byte size of the payload carried by a ``data:`` URL.
@@ -198,7 +221,9 @@ class CappingFormatterMixin:  # pylint: disable=too-few-public-methods
         try:
             result = await format_call()
             budget = _request_media_budget.get()
-            sizes = list(budget.sizes) if budget is not None else []
+            sizes: list[int] = []
+            if budget is not None and budget.sizes is not None:
+                sizes = list(budget.sizes)
         finally:
             self._end_media_budget(token)
 
@@ -219,6 +244,10 @@ class CappingFormatterMixin:  # pylint: disable=too-few-public-methods
             ),
         )
         try:
+            # The measuring pass already consumed the request's media
+            # dedup scope; clear it so the enforcing pass formats the same
+            # media the measuring pass measured.
+            reset_seen_media_scope()
             return await format_call()
         finally:
             self._end_media_budget(token)
@@ -251,6 +280,25 @@ class CappingFormatterMixin:  # pylint: disable=too-few-public-methods
         return {
             "type": "text",
             "text": self._placeholder_total_text(kind, inlined),
+        }
+
+    def _placeholder_dropped_text(self, kind: str) -> str:
+        return (
+            f"[{kind} omitted from model context: this request exceeds the "
+            f"{self.max_total_bytes}-byte per-request limit; the oldest "
+            f"media was dropped to keep the newest]"
+        )
+
+    def _placeholder_dropped(self, kind: str) -> dict[str, Any]:
+        """Placeholder for the oldest media dropped to fit the budget.
+
+        Unlike the running-budget placeholder this one carries no byte
+        count: the dropped media was never inlined, so reporting how many
+        bytes the request "already inlines" would be misleading.
+        """
+        return {
+            "type": "text",
+            "text": self._placeholder_dropped_text(kind),
         }
 
     def _maybe_cap(self, source: Any, kind: str) -> dict[str, Any] | None:
@@ -296,10 +344,7 @@ class CappingFormatterMixin:  # pylint: disable=too-few-public-methods
         budget.position += size
         if budget.position <= budget.dropped_prefix:
             # This block lies inside the dropped oldest prefix.
-            return self._placeholder_total(
-                kind,
-                max(0, budget.position - budget.dropped_prefix),
-            )
+            return self._placeholder_dropped(kind)
         if size > budget.remaining:
             return self._placeholder_total(
                 kind,
@@ -431,6 +476,9 @@ class _CappingGeminiFormatter(GeminiChatFormatter, CappingFormatterMixin):
     def _placeholder_total(self, kind: str, inlined: int) -> dict[str, Any]:
         return {"text": self._placeholder_total_text(kind, inlined)}
 
+    def _placeholder_dropped(self, kind: str) -> dict[str, Any]:
+        return {"text": self._placeholder_dropped_text(kind)}
+
     def _placeholder_unprepared(self, kind: str) -> dict[str, Any]:
         return {
             "text": (
@@ -553,6 +601,12 @@ class _CappingOpenAIResponseFormatter(
         return {
             "type": "input_text",
             "text": self._placeholder_total_text(kind, inlined),
+        }
+
+    def _placeholder_dropped(self, kind: str) -> dict[str, Any]:
+        return {
+            "type": "input_text",
+            "text": self._placeholder_dropped_text(kind),
         }
 
     def _placeholder_unprepared(self, kind: str) -> dict[str, Any]:
