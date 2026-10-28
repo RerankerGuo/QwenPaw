@@ -22,6 +22,8 @@ from agentscope.message import (
     DataBlock,
     Msg,
     TextBlock,
+    ToolCallBlock,
+    ToolResultBlock,
     URLSource,
 )
 
@@ -396,6 +398,57 @@ def _distinct_image_msg(index: int) -> Msg:
     )
 
 
+def _seeded_image_msg(index: int, seed: str) -> Msg:
+    """A user message carrying one image whose bytes end with *seed*.
+
+    Two messages built with the same seed carry the same media source,
+    so the Anthropic wire format treats the second one as a duplicate of
+    the first.
+    """
+    data = "A" * (_B64_CHARS - 1) + seed
+    return Msg(
+        name="user",
+        role="user",
+        content=[
+            TextBlock(text=f"look at this {index}"),
+            DataBlock(
+                source=Base64Source(data=data, media_type="image/png"),
+                name=f"img{index}.png",
+            ),
+        ],
+    )
+
+
+def _tool_result_image_msgs(seed: str) -> list[Msg]:
+    """An assistant tool call plus the tool result carrying one image."""
+    tool_msg = Msg(
+        name="assistant",
+        role="assistant",
+        content=[
+            ToolCallBlock(
+                id="call_1",
+                name="view_image",
+                input='{"path": "img.png"}',
+            ),
+            ToolResultBlock(
+                id="call_1",
+                name="view_image",
+                output=[
+                    TextBlock(text="here is the image"),
+                    DataBlock(
+                        source=Base64Source(
+                            data="A" * (_B64_CHARS - 1) + seed,
+                            media_type="image/png",
+                        ),
+                        name="img.png",
+                    ),
+                ],
+            ),
+        ],
+    )
+    return [tool_msg]
+
+
 def _data_url_image_msg(index: int) -> Msg:
     """A user message carrying one inline ``data:`` URL image block."""
     return Msg(
@@ -433,6 +486,8 @@ def _wire_parts(messages: list[dict]) -> list[dict]:
     """Flatten a formatted request into its content parts.
 
     Chat Completions / Anthropic use ``content``; Gemini uses ``parts``.
+    Tool results nest their own content list, which is flattened too so
+    media returned by a tool is visible to the assertions.
     """
     parts: list[dict] = []
     for message in messages:
@@ -441,7 +496,13 @@ def _wire_parts(messages: list[dict]) -> list[dict]:
             parts.append({"type": "text", "text": blocks})
         elif isinstance(blocks, list):
             parts.extend(blocks)
-    return parts
+    flattened: list[dict] = []
+    for part in parts:
+        nested = part.get("content")
+        if isinstance(nested, list):
+            flattened.extend(nested)
+        flattened.append(part)
+    return flattened
 
 
 def _total_limit_placeholders(parts: list[dict]) -> list[dict]:
@@ -449,6 +510,15 @@ def _total_limit_placeholders(parts: list[dict]) -> list[dict]:
         part
         for part in parts
         if "per-request limit" in (part.get("text") or "")
+    ]
+
+
+def _duplicate_placeholders(parts: list[dict]) -> list[dict]:
+    """Parts that fold a media source as a duplicate of an earlier one."""
+    return [
+        part
+        for part in parts
+        if "already shown above" in (part.get("text") or "")
     ]
 
 
@@ -468,6 +538,27 @@ def _media_parts(parts: list[dict]) -> list[dict]:
     return [
         part for part in parts if any(k in part for k in _MEDIA_PAYLOAD_KEYS)
     ]
+
+
+def _media_payload(part: dict) -> str:
+    """Return the base64 payload a media part carries.
+
+    Anthropic nests it under ``source``, Chat Completions wraps it in a
+    data URL under ``image_url``, and the Responses API puts the data
+    URL directly under ``image_url``.
+    """
+    source = part.get("source")
+    if isinstance(source, dict):
+        return str(source.get("data") or "")
+    image_url = part.get("image_url")
+    if isinstance(image_url, dict):
+        image_url = image_url.get("url")
+    if isinstance(image_url, str):
+        return image_url.rsplit(",", 1)[-1]
+    inline_data = part.get("inline_data")
+    if isinstance(inline_data, dict):
+        return str(inline_data.get("data") or "")
+    return ""
 
 
 class TestCumulativeBudget:
@@ -799,3 +890,135 @@ class TestCumulativeBudgetThroughProductionWrapper:
         kept = _media_parts(parts)
         assert len(kept) == 1
         assert parts[-1] == kept[0]
+
+
+class TestRepeatedMediaSurvivesTheBudget:
+    """A repeated media source must not be folded away by an older copy.
+
+    The budget drops the oldest media to keep the newest.  When the
+    dropped copy shares its source with a later one, the later copy has
+    to take its place — folding it as "already shown above" would leave
+    the request without that media at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_anthropic_wrapper_keeps_the_newest_repeated_media(
+        self,
+    ) -> None:
+        from qwenpaw.agents import model_factory
+
+        formatter_cls = model_factory._create_file_block_support_formatter(
+            _CappingAnthropicFormatter,
+        )
+        formatter = formatter_cls(max_bytes=1024, max_total_bytes=900)
+        messages = [
+            _seeded_image_msg(0, "A"),
+            _seeded_image_msg(1, "B"),
+            _seeded_image_msg(2, "A"),
+        ]
+
+        parts = _wire_parts(await formatter.format(messages))
+
+        kept = _media_parts(parts)
+        assert len(kept) == 1
+        assert parts[-1] == kept[0]
+        # The surviving media is the newest copy of A, not the copy of B
+        # that the budget kept before the fix.
+        assert _media_payload(kept[0]).endswith("A")
+        assert len(_total_limit_placeholders(parts)) == 2
+        assert not _duplicate_placeholders(parts)
+
+    @pytest.mark.asyncio
+    async def test_anthropic_wrapper_still_folds_a_repeated_source(
+        self,
+    ) -> None:
+        """A repeated source that fits the budget is still deduplicated."""
+        from qwenpaw.agents import model_factory
+
+        formatter_cls = model_factory._create_file_block_support_formatter(
+            _CappingAnthropicFormatter,
+        )
+        formatter = formatter_cls(max_bytes=1024, max_total_bytes=2048)
+        messages = [
+            _seeded_image_msg(0, "A"),
+            _seeded_image_msg(1, "A"),
+        ]
+
+        parts = _wire_parts(await formatter.format(messages))
+
+        kept = _media_parts(parts)
+        assert len(kept) == 1
+        assert len(_duplicate_placeholders(parts)) == 1
+        assert not _total_limit_placeholders(parts)
+
+    @pytest.mark.asyncio
+    async def test_anthropic_wrapper_keeps_the_newest_repeated_tool_media(
+        self,
+    ) -> None:
+        from qwenpaw.agents import model_factory
+
+        formatter_cls = model_factory._create_file_block_support_formatter(
+            _CappingAnthropicFormatter,
+        )
+        formatter = formatter_cls(max_bytes=1024, max_total_bytes=900)
+        messages = [
+            _seeded_image_msg(0, "A"),
+            _seeded_image_msg(1, "B"),
+            *_tool_result_image_msgs("A"),
+        ]
+
+        parts = _wire_parts(await formatter.format(messages))
+
+        kept = _media_parts(parts)
+        assert len(kept) == 1
+        assert _media_payload(kept[0]).endswith("A")
+        assert len(_total_limit_placeholders(parts)) == 2
+        assert not _duplicate_placeholders(parts)
+
+    @pytest.mark.asyncio
+    async def test_openai_wrapper_keeps_the_newest_repeated_media(
+        self,
+    ) -> None:
+        from qwenpaw.agents import model_factory
+
+        formatter_cls = model_factory._create_file_block_support_formatter(
+            _CappingOpenAIFormatter,
+        )
+        formatter = formatter_cls(max_bytes=1024, max_total_bytes=900)
+        messages = [
+            _seeded_image_msg(0, "A"),
+            _seeded_image_msg(1, "B"),
+            _seeded_image_msg(2, "A"),
+        ]
+
+        parts = _wire_parts(await formatter.format(messages))
+
+        kept = _media_parts(parts)
+        assert len(kept) == 1
+        assert parts[-1] == kept[0]
+        assert _media_payload(kept[0]).endswith("A")
+        assert len(_total_limit_placeholders(parts)) == 2
+
+    @pytest.mark.asyncio
+    async def test_responses_wrapper_keeps_the_newest_repeated_media(
+        self,
+    ) -> None:
+        from qwenpaw.agents import model_factory
+
+        formatter_cls = model_factory._create_file_block_support_formatter(
+            _CappingOpenAIResponseFormatter,
+        )
+        formatter = formatter_cls(max_bytes=1024, max_total_bytes=900)
+        messages = [
+            _seeded_image_msg(0, "A"),
+            _seeded_image_msg(1, "B"),
+            _seeded_image_msg(2, "A"),
+        ]
+
+        parts = _wire_parts(await formatter.format(messages))
+
+        kept = _media_parts(parts)
+        assert len(kept) == 1
+        assert parts[-1] == kept[0]
+        assert _media_payload(kept[0]).endswith("A")
+        assert len(_total_limit_placeholders(parts)) == 2

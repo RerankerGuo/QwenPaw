@@ -353,6 +353,29 @@ class CappingFormatterMixin:  # pylint: disable=too-few-public-methods
         budget.remaining -= size
         return None
 
+    def _account_media_occurrence(self, source: Any) -> None:
+        """Account one media occurrence that is not inlined.
+
+        A media block the formatter folds before the base formatter sees
+        it — a duplicate of media already inlined into this request —
+        still occupies a slot in the wire order.  The per-request budget
+        counts occurrences, so the folded occurrence has to be charged
+        to the budget as well: otherwise the enforcing pass would walk
+        a different sequence of sizes than the measuring pass measured,
+        and the byte prefix it drops would no longer line up with the
+        media it keeps.
+        """
+        budget = _request_media_budget.get()
+        if budget is None:
+            return
+        size = self._inline_media_size(source)
+        if size is None:
+            return
+        if budget.measuring:
+            budget.sizes.append(size)
+        else:
+            budget.position += size
+
     def _unprepared_local_placeholder(
         self,
         source: Any,

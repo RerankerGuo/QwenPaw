@@ -722,6 +722,19 @@ def _anthropic_media_dedup_key(
     return None
 
 
+def _carries_media_payload(formatted: Any) -> bool:
+    """Whether a formatted Anthropic block carries a media payload.
+
+    A block that carries media reached the wire; a text placeholder did
+    not.  Only media that reached the wire may suppress a later copy of
+    the same source.
+    """
+    return isinstance(formatted, dict) and isinstance(
+        formatted.get("source"),
+        dict,
+    )
+
+
 _WIRE_MEDIA_BLOCK_TYPES = frozenset(
     {
         "audio",
@@ -1698,6 +1711,13 @@ def _create_file_block_support_formatter(
             the second appearance of a given source becomes a short
             text placeholder instead of another base64 copy.
 
+            Only media that actually reaches the wire is remembered as
+            seen.  Media the per-request inline-media budget dropped is
+            *not* part of the request, so a later copy of the same
+            source has to stay eligible — otherwise the newest copy of
+            a repeated image would be folded as "already shown above"
+            while the copy that was dropped is nowhere in the request.
+
             Only the Anthropic base invokes this method — it lives on
             our subclass as dead code for OpenAI / Gemini bases.
             """
@@ -1709,26 +1729,36 @@ def _create_file_block_support_formatter(
                 seen = set()
                 _FORMATTER_SEEN_MEDIA_KEYS.set(seen)
             key = _anthropic_media_dedup_key(source) if source else None
-            if key is not None:
-                if key in seen:
-                    main_type = media_type.split("/")[0] or "media"
-                    return {
-                        "type": "text",
-                        "text": (
-                            f"[{main_type.title()} omitted — "
-                            f"already shown above]"
-                        ),
-                    }
-                seen.add(key)
+            if key is not None and key in seen:
+                # The media is already inlined into this request, so this
+                # copy is redundant.  Keep the request's byte accounting
+                # aligned: the occurrence still takes a slot in the wire
+                # order the budget measured.
+                if not media_type.startswith("video/"):
+                    account = getattr(self, "_account_media_occurrence", None)
+                    if account is not None:
+                        account(source)
+                main_type = media_type.split("/")[0] or "media"
+                return {
+                    "type": "text",
+                    "text": (
+                        f"[{main_type.title()} omitted — "
+                        f"already shown above]"
+                    ),
+                }
 
             if media_type.startswith("video/"):
-                return _format_anthropic_video_data_block(
+                formatted = _format_anthropic_video_data_block(
                     block,
                     max_inline_media_bytes=(
                         getattr(self, "max_bytes", MAX_INLINE_MEDIA_BYTES)
                     ),
                 )
-            return super()._format_anthropic_data_block(block)
+            else:
+                formatted = super()._format_anthropic_data_block(block)
+            if key is not None and _carries_media_payload(formatted):
+                seen.add(key)
+            return formatted
 
         # pylint: disable=too-many-branches, too-many-statements
         async def format(self, msgs):
