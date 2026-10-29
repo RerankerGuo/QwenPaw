@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, ClassVar
+from typing import Any, Awaitable, Callable, ClassVar, NamedTuple
 from urllib.parse import unquote_to_bytes
 
 # The capping formatters below override agentscope's ``_format_*_source``
@@ -72,26 +72,47 @@ _DASHSCOPE_AUDIO_FORMAT_BY_MIME = {
 }
 
 
+class _MediaOccurrence(NamedTuple):
+    """One media block the measuring pass saw, in wire order.
+
+    ``folded`` marks an occurrence the formatter replaced with an
+    "already shown above" placeholder before the base formatter saw it:
+    it occupies a slot in the wire order but sends no payload bytes.
+    """
+
+    key: tuple[str, str, str] | None
+    size: int
+    folded: bool
+
+
 @dataclass
 class _MediaBudget:
     """Per-request inline media accounting.
 
-    The first format pass *measures*: every media block the formatters touch
-    reports its size in wire order (``sizes``) and nothing is capped by the
-    cumulative budget. When the measured total overflows, the request is
-    formatted a second time with ``dropped_prefix`` set — the byte total of
-    the oldest media to drop so the newest fit the budget.
+    The first format pass *measures*: every media block the formatters
+    touch reports its ``_MediaOccurrence`` in wire order and nothing is
+    capped by the cumulative budget.  When the measured payload overflows,
+    the request is formatted a second time with ``dropped_before`` set —
+    the number of oldest occurrences to drop so the deduplicated payload
+    of the surviving media fits the budget.
+
+    Occurrence positions and payload bytes are accounted separately: a
+    folded duplicate occupies a slot in the wire order (both passes must
+    walk the same occurrence sequence) but sends no bytes, so it costs
+    nothing — unless the budget dropped every earlier copy of its source
+    and the surviving copy has to be re-inlined in its place.
     """
 
     remaining: int
-    sizes: list[int] | None = field(default=None)
-    dropped_prefix: int = 0
-    position: int = 0
+    occurrences: list[_MediaOccurrence] | None = field(default=None)
+    # Enforcing pass only: drop every occurrence with an index below it.
+    dropped_before: int = 0
+    index: int = 0
 
     @property
     def measuring(self) -> bool:
         """Whether this budget is in the measure-everything first pass."""
-        return self.sizes is not None
+        return self.occurrences is not None
 
 
 # One budget per in-flight format() call.  A ContextVar (rather than
@@ -163,6 +184,35 @@ def inline_media_size(source: Any) -> int | None:
     return None
 
 
+def media_dedup_key(source: Any) -> tuple[str, str, str] | None:
+    """Return a hashable key identifying a media source's content.
+
+    Shared by the per-request media dedup scope (the production formatter
+    wrapper folds a repeated source into a short "already shown above"
+    placeholder) and the per-request media budget below, so both agree on
+    which occurrences carry the same payload.
+
+    A user-uploaded image often re-appears inside ``view_image``'s
+    ``ToolResultBlock.output``.  Without dedup both copies get
+    base64-encoded into the wire request, doubling payload size and
+    occasionally tripping gateway limits (e.g. dash_anthropic's 6 MB
+    cap).  This key lets the formatter spot the second occurrence and
+    swap it for a short text placeholder.
+    """
+    media_type = getattr(source, "media_type", "") or ""
+    url = getattr(source, "url", None)
+    if url is not None:
+        return ("url", media_type, str(url))
+    data = getattr(source, "data", "") or ""
+    if data:
+        # Base64 is already a canonical immutable representation here.
+        # Using the string itself avoids decoding and hashing every media
+        # block again on every accumulated-history request. Python caches
+        # string hashes and set equality still compares the full content.
+        return ("base64", media_type, data)
+    return None
+
+
 class CappingFormatterMixin:  # pylint: disable=too-few-public-methods
     """Pydantic mixin shared by every capping formatter.
 
@@ -193,7 +243,7 @@ class CappingFormatterMixin:  # pylint: disable=too-few-public-methods
         if self.max_bytes <= 0 or self.max_total_bytes <= 0:
             return None
         return _request_media_budget.set(
-            _MediaBudget(remaining=self.max_total_bytes, sizes=[]),
+            _MediaBudget(remaining=self.max_total_bytes, occurrences=[]),
         )
 
     def _end_media_budget(self, token: Any) -> None:
@@ -206,13 +256,13 @@ class CappingFormatterMixin:  # pylint: disable=too-few-public-methods
     ) -> list:
         """Run one format() call under the per-request media budget.
 
-        The first pass measures every media block and does not enforce the
-        cumulative budget, so under-budget requests (the common case) are
-        returned as formatted. When the measured total overflows, the
-        request is formatted a second time, dropping the oldest media (a
-        byte prefix of the wire order) until the remaining media fit the
-        budget — formatting walks the conversation oldest-first, so this
-        keeps the *newest* media.
+        The first pass measures every media block and does not enforce
+        the cumulative budget, so under-budget requests (the common case)
+        are returned as formatted.  When the measured payload overflows,
+        the request is formatted a second time, dropping the oldest
+        occurrences until the deduplicated payload of the surviving media
+        fits the budget — formatting walks the conversation oldest-first,
+        so this keeps the *newest* media.
         """
         if self.max_bytes <= 0 or self.max_total_bytes <= 0:
             return await format_call()
@@ -221,26 +271,20 @@ class CappingFormatterMixin:  # pylint: disable=too-few-public-methods
         try:
             result = await format_call()
             budget = _request_media_budget.get()
-            sizes: list[int] = []
-            if budget is not None and budget.sizes is not None:
-                sizes = list(budget.sizes)
+            occurrences: list[_MediaOccurrence] = []
+            if budget is not None and budget.occurrences is not None:
+                occurrences = list(budget.occurrences)
         finally:
             self._end_media_budget(token)
 
-        total = sum(sizes)
-        if total <= self.max_total_bytes:
+        dropped_before = self._plan_dropped_prefix(occurrences)
+        if dropped_before <= 0:
             return result
-
-        dropped_prefix = 0
-        for size in sizes:
-            dropped_prefix += size
-            if total - dropped_prefix <= self.max_total_bytes:
-                break
 
         token = _request_media_budget.set(
             _MediaBudget(
                 remaining=self.max_total_bytes,
-                dropped_prefix=dropped_prefix,
+                dropped_before=dropped_before,
             ),
         )
         try:
@@ -251,6 +295,55 @@ class CappingFormatterMixin:  # pylint: disable=too-few-public-methods
             return await format_call()
         finally:
             self._end_media_budget(token)
+
+    def _payload_keeping_suffix(
+        self,
+        occurrences: list[_MediaOccurrence],
+        dropped_before: int,
+    ) -> int:
+        """Wire payload after dropping the ``dropped_before`` oldest
+        occurrences.
+
+        Simulates the enforcing pass: occurrences before the cut are
+        dropped and never reach the wire, a folded duplicate of a source
+        still on the wire stays folded (it sends no bytes), and a folded
+        duplicate whose every earlier copy was dropped is re-inlined —
+        its occurrence slot becomes the surviving copy of that source.
+        """
+        seen: set[tuple[str, str, str]] = set()
+        total = 0
+        for index, occurrence in enumerate(occurrences):
+            if index < dropped_before:
+                continue
+            key = occurrence.key
+            if occurrence.folded and key is not None and key in seen:
+                continue
+            if key is not None:
+                seen.add(key)
+            total += occurrence.size
+        return total
+
+    def _plan_dropped_prefix(
+        self,
+        occurrences: list[_MediaOccurrence],
+    ) -> int:
+        """Return how many oldest occurrences the enforcing pass drops.
+
+        The budget is spent on the *deduplicated* payload: a folded
+        duplicate costs nothing, so media is only dropped once the
+        distinct sources that actually reach the wire exceed the budget.
+        The cut is the smallest prefix whose removal lets the surviving
+        deduplicated payload fit — as much (newest) media as possible is
+        kept.  The payload only shrinks as the cut grows, so the first
+        fitting cut is the smallest.
+        """
+        for dropped_before in range(len(occurrences) + 1):
+            if (
+                self._payload_keeping_suffix(occurrences, dropped_before)
+                <= self.max_total_bytes
+            ):
+                return dropped_before
+        return len(occurrences)
 
     def _placeholder_text(self, kind: str, size: int) -> str:
         return (
@@ -327,10 +420,12 @@ class CappingFormatterMixin:  # pylint: disable=too-few-public-methods
     ) -> dict[str, Any] | None:
         """Measure the media (first pass) or enforce the budget (second).
 
-        The enforcing pass replaces the planned ``dropped_prefix`` bytes of
-        oldest media with placeholders, so the budget is spent on the newest
-        media. The per-request ``remaining`` check stays as a backstop in
-        case the two passes ever disagree.
+        The measuring pass records the occurrence — its dedup key, its
+        size, and the fact that it *is* sent — without capping.  The
+        enforcing pass replaces the planned ``dropped_before`` oldest
+        occurrences with placeholders, so the budget is spent on the
+        newest media.  The per-request ``remaining`` check stays as a
+        backstop in case the two passes ever disagree.
         """
         budget = _request_media_budget.get()
         if budget is None:
@@ -339,11 +434,18 @@ class CappingFormatterMixin:  # pylint: disable=too-few-public-methods
         if size is None:
             return None
         if budget.measuring:
-            budget.sizes.append(size)
+            budget.occurrences.append(
+                _MediaOccurrence(
+                    key=media_dedup_key(source),
+                    size=size,
+                    folded=False,
+                ),
+            )
             return None
-        budget.position += size
-        if budget.position <= budget.dropped_prefix:
-            # This block lies inside the dropped oldest prefix.
+        index = budget.index
+        budget.index += 1
+        if index < budget.dropped_before:
+            # This occurrence lies inside the dropped oldest prefix.
             return self._placeholder_dropped(kind)
         if size > budget.remaining:
             return self._placeholder_total(
@@ -353,17 +455,22 @@ class CappingFormatterMixin:  # pylint: disable=too-few-public-methods
         budget.remaining -= size
         return None
 
-    def _account_media_occurrence(self, source: Any) -> None:
-        """Account one media occurrence that is not inlined.
+    def _account_media_occurrence(
+        self,
+        source: Any,
+        key: tuple[str, str, str] | None = None,
+    ) -> None:
+        """Account one media occurrence that is folded, not sent.
 
         A media block the formatter folds before the base formatter sees
         it — a duplicate of media already inlined into this request —
-        still occupies a slot in the wire order.  The per-request budget
-        counts occurrences, so the folded occurrence has to be charged
-        to the budget as well: otherwise the enforcing pass would walk
-        a different sequence of sizes than the measuring pass measured,
-        and the byte prefix it drops would no longer line up with the
-        media it keeps.
+        becomes a short text placeholder: it takes a slot in the wire
+        order but sends no payload bytes.  The measuring pass therefore
+        records it with ``folded=True`` — payload nothing — while still
+        occupying its occurrence slot, so the enforcing pass walks the
+        same sequence.  A folded copy is only re-inlined when the budget
+        dropped every earlier copy of its source; until then it costs
+        the budget nothing.
         """
         budget = _request_media_budget.get()
         if budget is None:
@@ -372,9 +479,15 @@ class CappingFormatterMixin:  # pylint: disable=too-few-public-methods
         if size is None:
             return
         if budget.measuring:
-            budget.sizes.append(size)
+            budget.occurrences.append(
+                _MediaOccurrence(
+                    key=(key if key is not None else media_dedup_key(source)),
+                    size=size,
+                    folded=True,
+                ),
+            )
         else:
-            budget.position += size
+            budget.index += 1
 
     def _unprepared_local_placeholder(
         self,

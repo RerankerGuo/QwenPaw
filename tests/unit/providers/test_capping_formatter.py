@@ -36,8 +36,10 @@ from qwenpaw.providers.capping_formatter import (
     _CappingOpenAIFormatter,
     _CappingOpenAIResponseFormatter,
     _MediaBudget,
+    _MediaOccurrence,
     _request_media_budget,
     inline_media_size,
+    media_dedup_key,
 )
 
 _ALL_CAPPING_FORMATTERS = [
@@ -568,34 +570,36 @@ class TestCumulativeBudget:
         assert MAX_TOTAL_INLINE_MEDIA_BYTES == 4 * MAX_INLINE_MEDIA_BYTES
 
     def test_measure_pass_records_sizes_without_capping(self) -> None:
-        """The first pass measures every block and caps nothing."""
+        """The first pass records every sent occurrence, capping nothing."""
         formatter = _CappingOpenAIFormatter(
             max_bytes=1024,
             max_total_bytes=1,
         )
+        source = _base64_source(_EACH_IMAGE_BYTES, "image/png")
         token = formatter._begin_media_budget()
         try:
-            assert (
-                formatter._maybe_cap_total(
-                    _base64_source(_EACH_IMAGE_BYTES, "image/png"),
-                    "image",
-                )
-                is None
-            )
-            assert _request_media_budget.get().sizes == [_MEASURED_BYTES]
+            assert formatter._maybe_cap_total(source, "image") is None
+            assert _request_media_budget.get().occurrences == [
+                _MediaOccurrence(
+                    key=media_dedup_key(source),
+                    size=_MEASURED_BYTES,
+                    folded=False,
+                ),
+            ]
         finally:
             formatter._end_media_budget(token)
 
     def test_enforce_pass_drops_the_planned_oldest_prefix(self) -> None:
-        """Blocks inside ``dropped_prefix`` are replaced with placeholders;
-        the first block past it is kept and spends the budget."""
+        """Occurrences inside ``dropped_before`` are replaced with
+        placeholders; the first occurrence past it is kept and spends
+        the budget."""
         formatter = _CappingOpenAIFormatter(
             max_bytes=1024,
             max_total_bytes=900,
         )
         image = _base64_source(_EACH_IMAGE_BYTES, "image/png")
         token = _request_media_budget.set(
-            _MediaBudget(remaining=900, dropped_prefix=_MEASURED_BYTES),
+            _MediaBudget(remaining=900, dropped_before=1),
         )
         try:
             dropped = formatter._maybe_cap_total(image, "image")
@@ -606,6 +610,41 @@ class TestCumulativeBudget:
             assert formatter._maybe_cap_total(image, "image") is None
         finally:
             _request_media_budget.reset(token)
+
+    def test_folded_duplicate_costs_no_budget_until_reinflated(self) -> None:
+        """The plan charges only the deduplicated payload: a folded
+        duplicate costs nothing while its source is still on the wire,
+        and a folded copy is re-inlined once every earlier copy of its
+        source is dropped."""
+        formatter = _CappingOpenAIFormatter(
+            max_bytes=1024,
+            max_total_bytes=900,
+        )
+        key_a = ("base64", "image/png", "A")
+        key_b = ("base64", "image/png", "B")
+
+        # A -> B -> A(dup): dropping the two oldest occurrences re-inlines
+        # the newest A, so the surviving payload is 512 bytes, not 1024.
+        repeated = [
+            _MediaOccurrence(key=key_a, size=512, folded=False),
+            _MediaOccurrence(key=key_b, size=512, folded=False),
+            _MediaOccurrence(key=key_a, size=512, folded=True),
+        ]
+        assert formatter._plan_dropped_prefix(repeated) == 2
+
+        deduped = [
+            _MediaOccurrence(key=key_a, size=512, folded=False),
+            _MediaOccurrence(key=key_b, size=512, folded=False),
+            _MediaOccurrence(key=key_b, size=512, folded=True),
+        ]
+        # A -> B -> B(dup): the folded duplicate sends nothing, so the
+        # deduplicated payload is A + B = 1024 <= 1200 at this budget —
+        # nothing needs to be dropped at all.
+        formatter = _CappingOpenAIFormatter(
+            max_bytes=1024,
+            max_total_bytes=1200,
+        )
+        assert formatter._plan_dropped_prefix(deduped) == 0
 
     def test_media_over_the_per_file_cap_is_never_charged(self) -> None:
         """An oversized file is capped per-file, so it costs no budget."""
@@ -622,14 +661,18 @@ class TestCumulativeBudget:
             # The per-file placeholder fires, not the cumulative one.
             assert "inline limit of 512 bytes" in capped["text"]
             # ...so nothing was charged to the budget.
-            assert _request_media_budget.get().sizes == []
+            assert _request_media_budget.get().occurrences == []
 
             # A source within the per-file cap *is* measured by the
             # measuring pass, so it shows up in the budget accounting.
             small = _base64_source(64, "image/png")
             assert formatter._cap_media(small, "image") is None
-            assert _request_media_budget.get().sizes == [
-                inline_media_size(small),
+            assert _request_media_budget.get().occurrences == [
+                _MediaOccurrence(
+                    key=media_dedup_key(small),
+                    size=inline_media_size(small),
+                    folded=False,
+                ),
             ]
         finally:
             formatter._end_media_budget(token)
@@ -665,7 +708,13 @@ class TestCumulativeBudget:
         try:
             # A fresh measuring pass sees no earlier charges.
             assert formatter._maybe_cap_total(image, "image") is None
-            assert _request_media_budget.get().sizes == [_MEASURED_BYTES]
+            assert _request_media_budget.get().occurrences == [
+                _MediaOccurrence(
+                    key=media_dedup_key(image),
+                    size=_MEASURED_BYTES,
+                    folded=False,
+                ),
+            ]
         finally:
             formatter._end_media_budget(second)
 
@@ -1022,3 +1071,89 @@ class TestRepeatedMediaSurvivesTheBudget:
         assert parts[-1] == kept[0]
         assert _media_payload(kept[0]).endswith("A")
         assert len(_total_limit_placeholders(parts)) == 2
+
+
+class TestDeduplicatedPayloadFitsTheBudget:
+    """A folded duplicate sends no bytes, so it must cost no budget.
+
+    Regression: the measuring pass charged folded duplicates to the
+    budget, so A -> B -> B (513 bytes each, 1200-byte budget) measured
+    1539 bytes, dropped A, and kept only B — although after dedup
+    A + B need just 1026 bytes and both fit.
+    """
+
+    @pytest.mark.asyncio
+    async def test_anthropic_wrapper_keeps_both_when_dup_folds(
+        self,
+    ) -> None:
+        """A -> B -> B at a 1200-byte budget keeps both A and B."""
+        from qwenpaw.agents import model_factory
+
+        formatter_cls = model_factory._create_file_block_support_formatter(
+            _CappingAnthropicFormatter,
+        )
+        formatter = formatter_cls(max_bytes=1024, max_total_bytes=1200)
+        messages = [
+            _seeded_image_msg(0, "A"),
+            _seeded_image_msg(1, "B"),
+            _seeded_image_msg(2, "B"),
+        ]
+
+        parts = _wire_parts(await formatter.format(messages))
+
+        kept = _media_parts(parts)
+        assert len(kept) == 2
+        assert _media_payload(kept[0]).endswith("A")
+        assert _media_payload(kept[1]).endswith("B")
+        assert len(_duplicate_placeholders(parts)) == 1
+        assert not _total_limit_placeholders(parts)
+
+    @pytest.mark.asyncio
+    async def test_anthropic_wrapper_keeps_media_despite_folded_copies(
+        self,
+    ) -> None:
+        """One A followed by six copies of B (1.5 MiB each) fits the
+        default 8 MiB budget after dedup: the distinct media total
+        3 MiB, so A must not be dropped."""
+        from qwenpaw.agents import model_factory
+
+        mib = 1024 * 1024
+        b64_chars = ((3 * mib // 2 + 2) // 3) * 4
+        formatter_cls = model_factory._create_file_block_support_formatter(
+            _CappingAnthropicFormatter,
+        )
+        formatter = formatter_cls(
+            max_bytes=2 * mib,
+            max_total_bytes=8 * mib,
+        )
+
+        def _big_image_msg(index: int, seed: str) -> Msg:
+            data = "A" * (b64_chars - 1) + seed
+            return Msg(
+                name="user",
+                role="user",
+                content=[
+                    TextBlock(text=f"look at this {index}"),
+                    DataBlock(
+                        source=Base64Source(
+                            data=data,
+                            media_type="image/png",
+                        ),
+                        name=f"img{index}.png",
+                    ),
+                ],
+            )
+
+        messages = [
+            _big_image_msg(0, "A"),
+            *[_big_image_msg(i, "B") for i in range(1, 7)],
+        ]
+
+        parts = _wire_parts(await formatter.format(messages))
+
+        kept = _media_parts(parts)
+        assert len(kept) == 2
+        assert _media_payload(kept[0]).endswith("A")
+        assert _media_payload(kept[1]).endswith("B")
+        assert len(_duplicate_placeholders(parts)) == 5
+        assert not _total_limit_placeholders(parts)

@@ -58,6 +58,7 @@ from ..providers.capping_formatter import (
     CappingFormatterMixin,
     MAX_INLINE_MEDIA_BYTES,
     SEEN_MEDIA_KEYS as _FORMATTER_SEEN_MEDIA_KEYS,
+    media_dedup_key as _anthropic_media_dedup_key,
 )
 from ..providers.typesafe_provider import (
     TypeSafeEvaluationError,
@@ -696,30 +697,10 @@ def _normalize_messages_for_formatter(
     )
 
 
-def _anthropic_media_dedup_key(
-    source: Any,
-) -> tuple[str, str, str] | None:
-    """Return a hashable key identifying a media source for dedup.
-
-    A user-uploaded image often re-appears inside ``view_image``'s
-    ``ToolResultBlock.output``.  Without dedup both copies get
-    base64-encoded into the wire request, doubling payload size and
-    occasionally tripping gateway limits (e.g. dash_anthropic's 6 MB
-    cap).  This key lets the formatter spot the second occurrence and
-    swap it for a short text placeholder.
-    """
-    media_type = getattr(source, "media_type", "") or ""
-    url = getattr(source, "url", None)
-    if url is not None:
-        return ("url", media_type, str(url))
-    data = getattr(source, "data", "") or ""
-    if data:
-        # Base64 is already a canonical immutable representation here.
-        # Using the string itself avoids decoding and hashing every media
-        # block again on every accumulated-history request. Python caches
-        # string hashes and set equality still compares the full content.
-        return ("base64", media_type, data)
-    return None
+# The media dedup key itself lives with the formatter media policy in
+# ``providers.capping_formatter`` (imported above as
+# ``_anthropic_media_dedup_key``) so the per-request inline-media budget
+# and the dedup scope agree on which occurrences carry the same payload.
 
 
 def _carries_media_payload(formatted: Any) -> bool:
@@ -1731,13 +1712,14 @@ def _create_file_block_support_formatter(
             key = _anthropic_media_dedup_key(source) if source else None
             if key is not None and key in seen:
                 # The media is already inlined into this request, so this
-                # copy is redundant.  Keep the request's byte accounting
-                # aligned: the occurrence still takes a slot in the wire
-                # order the budget measured.
+                # copy is redundant.  Keep the request's occurrence
+                # accounting aligned: the folded copy still takes a slot
+                # in the wire order the budget measured, but — folded —
+                # it sends no payload bytes and costs the budget nothing.
                 if not media_type.startswith("video/"):
                     account = getattr(self, "_account_media_occurrence", None)
                     if account is not None:
-                        account(source)
+                        account(source, key)
                 main_type = media_type.split("/")[0] or "media"
                 return {
                     "type": "text",
